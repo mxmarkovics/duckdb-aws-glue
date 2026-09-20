@@ -1,14 +1,81 @@
 #include "catalog/glue_transaction.hpp"
 #include "catalog/glue_catalog.hpp"
 
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
 namespace duckdb {
 
+namespace {
+
+//! A rollback clears the caches held here: a failed statement must not leave metadata it resolved behind.
+class GlueMetadataCacheState : public ClientContextState {
+public:
+	shared_ptr<GlueTransactionCache> GetCache(const string &catalog_name, idx_t attach_oid) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		auto &entry = caches[catalog_name];
+		// Keyed by the attach identity, not just the alias: after DETACH + re-ATTACH under the same alias the
+		// new attached database must not be served the old catalog's metadata, even where the DETACH hook
+		// (EraseCache) could not reach this state. Replacing the entry also keeps one entry per alias.
+		if (!entry.cache || entry.attach_oid != attach_oid) {
+			entry = {attach_oid, make_shared_ptr<GlueTransactionCache>()};
+		}
+		return entry.cache;
+	}
+
+	void EraseCache(const string &catalog_name, idx_t attach_oid) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		auto entry = caches.find(catalog_name);
+		if (entry != caches.end() && entry->second.attach_oid == attach_oid) {
+			caches.erase(entry);
+		}
+	}
+
+	void ClearAll() {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		for (auto &entry : caches) {
+			entry.second.cache->Clear();
+		}
+	}
+
+	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override {
+		ClearAll();
+	}
+
+private:
+	struct CatalogCache {
+		idx_t attach_oid;
+		shared_ptr<GlueTransactionCache> cache;
+	};
+
+	annotated_mutex lock;
+	unordered_map<string, CatalogCache> caches DUCKDB_GUARDED_BY(lock);
+};
+
+bool ConnectionScopedMetadataCache(ClientContext &context) {
+	Value scope;
+	if (context.TryGetCurrentSetting("glue_metadata_cache_scope", scope) && !scope.IsNull()) {
+		return StringUtil::Lower(StringValue::Get(scope)) == "connection";
+	}
+	// matches the registered default of glue_metadata_cache_scope: 'transaction'
+	return false;
+}
+
+} // namespace
+
 GlueTransaction::GlueTransaction(GlueCatalog &glue_catalog, TransactionManager &manager, ClientContext &context)
     : Transaction(manager, context), glue_catalog(glue_catalog),
       transaction_state(GlueTransactionState::TRANSACTION_NOT_YET_STARTED) {
+	if (ConnectionScopedMetadataCache(context)) {
+		auto state = context.registered_state->GetOrCreate<GlueMetadataCacheState>("glue_metadata_cache");
+		cache = state->GetCache(glue_catalog.GetName().GetIdentifierName(), glue_catalog.GetAttached().oid);
+	} else {
+		cache = make_shared_ptr<GlueTransactionCache>();
+	}
 }
 
 GlueTransaction::~GlueTransaction() {
@@ -32,6 +99,47 @@ void GlueTransaction::Rollback() {
 
 GlueTransaction &GlueTransaction::Get(ClientContext &context, Catalog &catalog) {
 	return Transaction::Get(context, catalog).Cast<GlueTransaction>();
+}
+
+optional_ptr<GlueTransactionCache> GlueTransactionCache::Of(ClientContext &context, Catalog &catalog) {
+	auto transaction = Transaction::TryGet(context, catalog.GetAttached());
+	if (!transaction) {
+		return nullptr;
+	}
+	return transaction->Cast<GlueTransaction>().cache.get();
+}
+
+void GlueTransactionCache::Invalidate(ClientContext &context, Catalog &catalog) {
+	// Get() not Of(): a connection-scoped cache outlives transactions and must be cleared even from a bare mutation
+	GlueTransaction::Get(context, catalog).cache->Clear();
+	// The scope setting can change between statements, so the active transaction's cache may not be the
+	// connection-level one this write would otherwise leave stale: clear those too (all of them, matching
+	// the rollback hook — a write through any alias of the same Glue catalog must not be hidden by another's cache)
+	auto state = context.registered_state->Get<GlueMetadataCacheState>("glue_metadata_cache");
+	if (state) {
+		state->ClearAll();
+	}
+}
+
+void GlueTransactionCache::OnDetach(ClientContext &context, Catalog &catalog) {
+	auto state = context.registered_state->Get<GlueMetadataCacheState>("glue_metadata_cache");
+	if (state) {
+		state->EraseCache(catalog.GetName().GetIdentifierName(), catalog.GetAttached().oid);
+	}
+}
+
+GlueTransactionCache::InvalidateOnExit::~InvalidateOnExit() {
+	// A destructor must not throw: log what went wrong instead, so the swallowed exception is not silent
+	try {
+		Invalidate(context, catalog);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		DUCKDB_LOG_WARNING(context, "Could not invalidate the Glue metadata cache of catalog '%s': %s",
+		                   catalog.GetName().GetIdentifierName(), error.RawMessage());
+	} catch (...) {
+		DUCKDB_LOG_WARNING(context, "Could not invalidate the Glue metadata cache of catalog '%s': unknown exception",
+		                   catalog.GetName().GetIdentifierName());
+	}
 }
 
 } // namespace duckdb
