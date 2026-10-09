@@ -1,6 +1,7 @@
 #include "catalog/glue_transaction.hpp"
 #include "catalog/glue_catalog.hpp"
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -99,6 +100,11 @@ void GlueTransaction::Rollback() {
 
 GlueTransaction &GlueTransaction::Get(ClientContext &context, Catalog &catalog) {
 	return Transaction::Get(context, catalog).Cast<GlueTransaction>();
+}
+
+idx_t GlueTransactionCache::NextId() {
+	static atomic<idx_t> next_id {0};
+	return ++next_id;
 }
 
 optional_ptr<GlueTransactionCache> GlueTransactionCache::Of(ClientContext &context, Catalog &catalog) {
