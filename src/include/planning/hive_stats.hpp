@@ -10,9 +10,14 @@ class BaseStatistics;
 struct GluePartitionInfo;
 struct HiveScanInfo;
 
-//! The recursive listing of 'directory' in this query, fetched page by page as it is read: every scan and the sample
-//! share it, so a directory is listed once per query
-shared_ptr<MultiFileList> GetDirectoryListing(ClientContext &context, const string &directory);
+//! The recursive listing of 'directory', fetched page by page as it is read: every scan and the sample share it, so a
+//! directory is listed once per query. With 'cache_in_connection' the listing is kept beyond the query, until a write
+//! through this connection, a rollback, or (under glue_metadata_cache_scope='transaction') the end of the transaction
+//! clears it.
+shared_ptr<MultiFileList> GetDirectoryListing(ClientContext &context, const string &directory,
+                                              bool cache_in_connection = false);
+//! Drop the connection's cached directory listings (after a write through this connection)
+void ClearHiveListingCache(ClientContext &context);
 //! The partitions Glue registers for the table of 'info' in this query, fetched once for every scan of the table
 shared_ptr<const vector<GluePartitionInfo>> GetTablePartitions(ClientContext &context, const HiveScanInfo &info);
 

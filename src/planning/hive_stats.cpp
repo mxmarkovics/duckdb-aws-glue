@@ -112,6 +112,53 @@ static shared_ptr<HiveQueryCache> GetQueryCache(ClientContext &context) {
 	return context.registered_state->GetOrCreate<HiveQueryCache>(HIVE_QUERY_CACHE);
 }
 
+//===--------------------------------------------------------------------===//
+// Per-connection listing cache (glue_cache_listings)
+//===--------------------------------------------------------------------===//
+static constexpr const char *HIVE_LISTING_CACHE = "glue_listing_cache";
+
+//! The directory listings of Glue tables, kept across queries: a later statement of the connection scans without
+//! listing again. Follows glue_metadata_cache_scope and is cleared with the metadata cache -- by writes through this
+//! connection (GlueTransactionCache::Invalidate), by rollback, and at commit unless the scope is 'connection'.
+class HiveListingCache : public ClientContextState {
+public:
+	shared_ptr<MultiFileList> GetListing(ClientContext &context, const string &directory) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		auto &listing = listings[directory];
+		if (!listing) {
+			auto &fs = FileSystem::GetFileSystem(context);
+			listing = shared_ptr<MultiFileList>(fs.GlobFileList(directory + "/**", FileGlobOptions::ALLOW_EMPTY));
+		}
+		return listing;
+	}
+
+	void Clear() {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		listings.clear();
+	}
+
+	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
+		if (!GlueTransactionCache::ConnectionScoped(context)) {
+			Clear();
+		}
+	}
+
+	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override {
+		Clear();
+	}
+
+private:
+	annotated_mutex lock;
+	unordered_map<string, shared_ptr<MultiFileList>> listings DUCKDB_GUARDED_BY(lock);
+};
+
+void ClearHiveListingCache(ClientContext &context) {
+	auto cache = context.registered_state->Get<HiveListingCache>(HIVE_LISTING_CACHE);
+	if (cache) {
+		cache->Clear();
+	}
+}
+
 static string TableKey(const HiveScanInfo &info) {
 	return info.catalog_name + "." + info.Describe();
 }
@@ -122,7 +169,12 @@ static string DirectoryKey(const string &location) {
 	return directory;
 }
 
-shared_ptr<MultiFileList> GetDirectoryListing(ClientContext &context, const string &directory) {
+shared_ptr<MultiFileList> GetDirectoryListing(ClientContext &context, const string &directory,
+                                              bool cache_in_connection) {
+	if (cache_in_connection) {
+		auto cache = context.registered_state->GetOrCreate<HiveListingCache>(HIVE_LISTING_CACHE);
+		return cache->GetListing(context, DirectoryKey(directory));
+	}
 	return GetQueryCache(context)->GetDirectoryListing(context, DirectoryKey(directory));
 }
 
